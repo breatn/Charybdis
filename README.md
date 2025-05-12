@@ -1,0 +1,2 @@
+# Charybdis
+Hashing algorithm
