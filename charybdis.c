@@ -1,21 +1,21 @@
-/* Charybdis Hashing Algorithm*/
+/* Charybdis Lattice-Based Hashing Algorithm */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 
-//initialise variables
 #define INITIAL_CAPACITY 1024
-#define BLOCK_SIZE 8
+#define BLOCK_SIZE 8  // bytes
 #define CHARYBDIS_ROUNDS 10000
+#define LATTICE_DIM 64 
 
-// 64-bit rotate-left
+// Utility: 64-bit rotate-left
 static inline uint64_t rotl64(uint64_t x, int r) {
     return (x << r) | (x >> (64 - r));
 }
 
-// Xorshift64* PRNG
+// PRNG: Xorshift64*
 uint64_t prng64(uint64_t *state) {
     uint64_t x = *state;
     x ^= x >> 12;
@@ -25,17 +25,13 @@ uint64_t prng64(uint64_t *state) {
     return x * 0x2545F4914F6CDD1DULL;
 }
 
-// Chaos mixing function
-uint64_t chaos_mix(uint64_t x, uint64_t key, int rnd) {
-    const uint64_t ADD = 0x9E3779B97F4A7C15ULL;
-    const uint64_t MUL = 0x94D049BB133111EBULL;
-    for (int i = 0; i < (rnd % 16) + 1; i++) {
-        x ^= key + ADD;
-        x = rotl64(x, (i * 13 + rnd) & 63);
-        x *= (MUL ^ (key >> (i & 31)));
-        x ^= x >> 27;
+// Simulated lattice-based trapdoor mixing 
+uint64_t lattice_mix(uint64_t x, uint64_t vec[LATTICE_DIM], int rnd) {
+    uint64_t acc = x;
+    for (int i = 0; i < LATTICE_DIM; i++) {
+        acc ^= rotl64(vec[i] ^ (x + i * rnd), (i * 17 + rnd) & 63);
     }
-    return x;
+    return acc ^ (acc >> 29);
 }
 
 // Read entire input from stdin into a buffer
@@ -78,6 +74,9 @@ void secure_hash256(const char *msg, size_t len, uint64_t out[8]) {
         0x1F83D9ABFB41BD6BULL, 0x5BE0CD19137E2179ULL
     };
 
+    uint64_t lattice[LATTICE_DIM];
+    for (int i = 0; i < LATTICE_DIM; i++) lattice[i] = (i * 0xABCDEF1234567890ULL) ^ (i * i + 1);
+
     size_t blocks = (len + BLOCK_SIZE - 1) / BLOCK_SIZE;
     size_t *order = malloc(blocks * sizeof(size_t));
     if (!order) { perror("malloc"); exit(1); }
@@ -92,11 +91,11 @@ void secure_hash256(const char *msg, size_t len, uint64_t out[8]) {
         size_t size = remaining > BLOCK_SIZE ? BLOCK_SIZE : remaining;
         memcpy(&block, msg + i * BLOCK_SIZE, size);
 
-        block ^= (uint64_t)len ^ ((uint64_t)i << 3);  // simple length/key mixing
+        block ^= (uint64_t)len ^ ((uint64_t)i << 3);
 
         for (int j = 0; j < 8; j++) {
             uint64_t m = block ^ state[(j + 5) & 7];
-            state[j] = chaos_mix(state[j] ^ m, state[(j + 3) & 7], (int)i + j + 1);
+            state[j] = lattice_mix(state[j] ^ m, lattice, (int)i + j + 1);
         }
 
         // state permutation
@@ -108,13 +107,11 @@ void secure_hash256(const char *msg, size_t len, uint64_t out[8]) {
 
     free(order);
 
-    // Sponge-like chaos rounds
+    // Final sponge-like lattice rounds
     for (int r = 0; r < CHARYBDIS_ROUNDS; r++) {
         for (int j = 0; j < 8; j++) {
-            state[j] = chaos_mix(state[j] ^ state[(j + 2) & 7],
-                                 state[(j + 1) & 7] ^ state[(j + 3) & 7], r + j);
+            state[j] = lattice_mix(state[j] ^ state[(j + 2) & 7], lattice, r + j);
         }
-        // Round-dependent state swap
         uint64_t tmp = state[r % 8];
         state[r % 8] = state[(r + 4) % 8];
         state[(r + 4) % 8] = tmp;
@@ -123,7 +120,6 @@ void secure_hash256(const char *msg, size_t len, uint64_t out[8]) {
     memcpy(out, state, 8 * sizeof(uint64_t));
 }
 
-// Entry point
 int main(void) {
     size_t len;
     char *msg = read_message(&len);
