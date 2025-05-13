@@ -4,7 +4,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
-#include <openssl/sha.h>
 
 #define INITIAL_CAPACITY 1024
 #define BLOCK_SIZE 8  // bytes
