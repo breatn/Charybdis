@@ -4,10 +4,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <openssl/sha.h>
 
 #define INITIAL_CAPACITY 1024
 #define BLOCK_SIZE 8  // bytes
-#define CHARYBDIS_ROUNDS 10000
+#define CHARYBDIS_ROUNDS 250
 #define LATTICE_DIM 64 
 
 // Utility: 64-bit rotate-left
@@ -15,23 +16,119 @@ static inline uint64_t rotl64(uint64_t x, int r) {
     return (x << r) | (x >> (64 - r));
 }
 
-// PRNG: Xorshift64*
-uint64_t prng64(uint64_t *state) {
-    uint64_t x = *state;
-    x ^= x >> 12;
-    x ^= x << 25;
-    x ^= x >> 27;
-    *state = x;
-    return x * 0x2545F4914F6CDD1DULL;
+static inline uint32_t rotl32(uint32_t x, int r) {
+    return (x << r) | (x >> (32 - r));
 }
 
-// Simulated lattice-based trapdoor mixing 
-uint64_t lattice_mix(uint64_t x, uint64_t vec[LATTICE_DIM], int rnd) {
-    uint64_t acc = x;
-    for (int i = 0; i < LATTICE_DIM; i++) {
-        acc ^= rotl64(vec[i] ^ (x + i * rnd), (i * 17 + rnd) & 63);
+#define QR(a,b,c,d) do {         \
+    a += b; d ^= a; d = rotl32(d,16);  \
+    c += d; b ^= c; b = rotl32(b,12);    \
+    a += b; d ^= a; d = rotl32(d,8);     \
+    c += d; b ^= c; b = rotl32(b,7);      \
+} while(0)
+
+// ChaCha20 block function.
+// key_seed is used to derive a 256-bit key and counter is the block counter.
+static void chacha20_block(uint64_t key_seed, uint32_t counter, uint8_t output[64]) {
+    uint32_t state[16], working[16];
+
+    //constants
+    state[0]  = 0x61707865;
+    state[1]  = 0x3320646e;
+    state[2]  = 0x79622d32;
+    state[3]  = 0x6b206574;
+
+    // Derive 256-bit key from key_seed.
+    uint32_t k0 = (uint32_t)(key_seed & 0xffffffff);
+    uint32_t k1 = (uint32_t)((key_seed >> 32) & 0xffffffff);
+    uint32_t k2 = k0 ^ 0xdeadbeef;
+    uint32_t k3 = k1 ^ 0xcafebabe;
+    uint32_t k4 = ~k0;
+    uint32_t k5 = ~k1;
+    uint32_t k6 = k0 + k1;
+    uint32_t k7 = k0 ^ k1;
+    state[4]  = k0; state[5]  = k1; state[6]  = k2; state[7]  = k3;
+    state[8]  = k4; state[9]  = k5; state[10] = k6; state[11] = k7;
+
+    state[12] = counter;
+    state[13] = 0;
+    state[14] = 0;
+    state[15] = 0;
+
+    memcpy(working, state, sizeof(state));
+
+    // 20 rounds 
+    for (int i = 0; i < 10; i++) {
+        // Column rounds
+        QR(working[0], working[4],  working[8],  working[12]);
+        QR(working[1], working[5],  working[9],  working[13]);
+        QR(working[2], working[6],  working[10], working[14]);
+        QR(working[3], working[7],  working[11], working[15]);
+        // Diagonal rounds
+        QR(working[0], working[5],  working[10], working[15]);
+        QR(working[1], working[6],  working[11], working[12]);
+        QR(working[2], working[7],  working[8],  working[13]);
+        QR(working[3], working[4],  working[9],  working[14]);
     }
-    return acc ^ (acc >> 29);
+    for (int i = 0; i < 16; i++) {
+        working[i] += state[i];
+    }
+    // Serialize state to output
+    for (int i = 0; i < 16; i++) {
+        output[i * 4 + 0] = working[i] & 0xff;
+        output[i * 4 + 1] = (working[i] >> 8) & 0xff;
+        output[i * 4 + 2] = (working[i] >> 16) & 0xff;
+        output[i * 4 + 3] = (working[i] >> 24) & 0xff;
+    }
+}
+
+// ChaCha20 PRNG
+uint64_t prng64(uint64_t *state) {
+    // Use the current state as the key seed and block counter
+    uint64_t key_seed = *state;
+    uint32_t counter = (uint32_t)(*state & 0xffffffff);
+    *state = *state + 1;
+
+    uint8_t block[64];
+    chacha20_block(key_seed, counter, block);
+
+    // Return the first 8 bytes of the block as a 64-bit number
+    uint64_t result = 0;
+    for (int i = 7; i >= 0; i--) {
+        result = (result << 8) | block[i];
+    }
+    return result;
+}
+
+// LWE/NTRU lattice mixing function
+uint64_t lattice_mix(uint64_t x, uint64_t vec[LATTICE_DIM], int rnd) {
+    uint64_t noise[LATTICE_DIM];
+    uint64_t conv[LATTICE_DIM];
+    // Duplicate noise into an extended array to avoid modulo calculations
+    uint64_t noise_ext[2 * LATTICE_DIM];
+
+    // Generate a noise polynomial with 8-bit coefficients
+    for (int i = 0; i < LATTICE_DIM; i++) {
+        noise[i] = (((x >> (i % 32)) & 0xFF) + rnd + i) & 0xFF;
+        noise_ext[i] = noise[i];
+        noise_ext[i + LATTICE_DIM] = noise[i];
+    }
+
+    // Compute circular convolution using extended noise array
+    for (int k = 0; k < LATTICE_DIM; k++) {
+        conv[k] = 0;
+        int offset = LATTICE_DIM - k;
+        for (int i = 0; i < LATTICE_DIM; i++) {
+            conv[k] += vec[i] * noise_ext[offset + i];
+        }
+    }
+
+    // Combine the convolution coefficients into a 64-bit value using rotate-mix
+    uint64_t result = x;
+    for (int i = 0; i < LATTICE_DIM; i++) {
+        result ^= rotl64(conv[i], (i * 7 + rnd) & 63);
+    }
+    return result ^ (result >> 29);
 }
 
 // Read entire input from stdin into a buffer
